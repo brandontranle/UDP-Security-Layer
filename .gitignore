@@ -1,0 +1,6 @@
+dumps
+results
+client
+server
+.DS_Store
+*.o
