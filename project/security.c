@@ -20,7 +20,7 @@ static uint8_t *cached_client_hello = NULL;
 static size_t cached_client_hello_size = 0;
 int global_type = 0;
 
-
+// can't fucking do this
 static void client_send_hello(uint8_t* buf) {
     // Create CLIENT_HELLO TLV
     tlv *ch = create_tlv(CLIENT_HELLO);
@@ -105,7 +105,6 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
     if (cached_client_hello == NULL && global_type == CLIENT) {
         // create CLIENT_HELLO TLV
         tlv *ch = create_tlv(CLIENT_HELLO);
-        fprintf(stderr, "CLIENT: Created CLIENT_HELLO TLV with type 0x%02x\n", ch->type);
 
         // add nonce
         tlv* nn = create_tlv(NONCE);
