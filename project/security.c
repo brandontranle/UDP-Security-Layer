@@ -228,11 +228,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         
         return sh_len;
 }    
-    // CLIENT PROCESSING SERVER HELLO
-    // Modified version of the CLIENT_FINISHED section with improved transcript calculation
-// Replace the existing client finished part in your input_sec function with this:
-
-// Precise transcript calculation as per specification
+//CLIENT SENDING CLIENT FINISHED
 else if (global_type == CLIENT && global_hs_state == IN_CLIENT_FINISHED && server_hello_received) {
     fprintf(stderr, "CLIENT_FINISHED\n");
     
@@ -399,8 +395,6 @@ void process_client_hello(uint8_t* buf, size_t length)
 
 
 // The issue might be in how we're caching the server hello and what data we're using
-// Let's fix the process_server_hello function to ensure we're caching the correct data
-
 void process_server_hello(uint8_t* buf, size_t length) {   
     fprintf(stderr, "Processing server hello\n");
 
@@ -412,7 +406,7 @@ void process_server_hello(uint8_t* buf, size_t length) {
     }
 
     fprintf(stderr, "Server hello received\n");
-    
+
     cached_server_hello = malloc(length);
     memcpy(cached_server_hello, buf, length);
     cached_server_hello_size = length;
