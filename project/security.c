@@ -6,16 +6,6 @@
 #include <string.h>
 #include <unistd.h>
 
-//i fucking hate c
-
-
-/* 
-To start the handshake procedure, the client will send a Client Hello message. 
-This message contains a random value (called a nonce). 
-Generate a public/private key pair and send the public key. 
-Make sure to cache the entire Client Hello message-you'll need it for another step.
-*/
-
 #define IN_CLIENT_HELLO 0
 #define IN_SERVER_HELLO 1
 #define IN_CLIENT_FINISHED 2
@@ -27,24 +17,12 @@ static size_t client_nonce_size = 0;
 static uint8_t *server_nonce = NULL;
 static size_t server_nonce_size = 0;
 static uint8_t *cached_client_hello = NULL;
-
-
-tlv* cached_ch = NULL;
-tlv* cached_ch_nonce = NULL;
-tlv* cached_ch_pk = NULL;
-tlv* cached_ch_sig = NULL;
-
-
 static size_t cached_client_hello_size = 0;
 static uint8_t *cached_server_hello = NULL;
 static size_t cached_server_hello_size = 0;
 static uint8_t *cached_client_finished = NULL;
 static size_t cached_client_finished_size = 0;
 static char *expected_dns_name = NULL;
-
-
-
-
 
 int global_type = 0;
 int global_hs_state = 0;
@@ -65,7 +43,7 @@ void init_sec(int type, char* host) {
         load_ca_public_key("ca_public_key.bin");
         // Store expected DNS name for verification
         if (host) {
-            expected_dns_name = host;
+            expected_dns_name = strdup(host);
         }
     } else if (type == SERVER) {
         global_hs_state = IN_SERVER_HELLO;
@@ -75,12 +53,9 @@ void init_sec(int type, char* host) {
     }
 }
 
-
-
 ssize_t input_sec(uint8_t* buf, size_t max_length) {
     // CLIENT HELLO PHASE
     if (global_type == CLIENT && global_hs_state == IN_CLIENT_HELLO) {
-
         fprintf(stderr, "CLIENT_HELLO\n");
 
         // Create CLIENT_HELLO TLV
@@ -92,6 +67,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         generate_nonce(nonce, NONCE_SIZE);
         
         // Save the client nonce for later verification
+        if (client_nonce) free(client_nonce);
         client_nonce = malloc(NONCE_SIZE);
         memcpy(client_nonce, nonce, NONCE_SIZE);
         client_nonce_size = NONCE_SIZE;
@@ -107,10 +83,15 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         // Serialize and send
         uint16_t len = serialize_tlv(buf, ch);
 
-        // Cache the client hello
+        // Cache the client hello - Make sure to create a fresh copy
+        if (cached_client_hello) free(cached_client_hello);
         cached_client_hello = malloc(len);
         memcpy(cached_client_hello, buf, len);
         cached_client_hello_size = len;
+
+        // Debug output for verification
+        fprintf(stderr, "Cached Client Hello (%zu bytes):\n", cached_client_hello_size);
+        print_tlv_bytes(cached_client_hello, cached_client_hello_size);
 
         // Clean up
         free_tlv(ch);
@@ -118,11 +99,9 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         global_hs_state = IN_SERVER_HELLO;
 
         fprintf(stderr, "CLIENT_HELLO done\n");
-
         return len;
     } 
     else if (global_type == SERVER && global_hs_state == IN_SERVER_HELLO && client_hello_received) {
-    
         fprintf(stderr, "SERVER_HELLO\n");
     
         // Create SERVER_HELLO TLV
@@ -134,6 +113,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         generate_nonce(nonce, NONCE_SIZE);
         
         // Save the server nonce for later use
+        if (server_nonce) free(server_nonce);
         server_nonce = malloc(NONCE_SIZE);
         memcpy(server_nonce, nonce, NONCE_SIZE);
         server_nonce_size = NONCE_SIZE;
@@ -142,10 +122,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         add_tlv(sh, nn);
         
         // 2. Add the certificate - IMPORTANT: This is already in TLV format
-        // The certificate variable should contain a properly formatted TLV structure
         tlv* cert_from_file = deserialize_tlv(certificate, cert_size);
-    
-        print_tlv_bytes(certificate, cert_size);
     
         if (cert_from_file == NULL || cert_from_file->type != CERTIFICATE) {
             fprintf(stderr, "Invalid certificate format\n");
@@ -160,8 +137,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         add_val(server_pk, public_key, pub_key_size);
         add_tlv(sh, server_pk);
     
-    
-        // 4. handshake signature   
+        // 4. Create handshake signature
         fprintf(stderr, "Creating handshake signature\n");
 
         // We need to serialize each component (except client_hello which is already serialized)
@@ -202,8 +178,6 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         // Sign the data
         uint8_t signature[256];
         size_t sig_size = sign(signature, sign_data, sign_data_size);
-
-
         free(sign_data);
 
         // Add signature to SERVER_HELLO
@@ -215,6 +189,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         uint16_t sh_len = serialize_tlv(buf, sh);
         
         // Cache the server hello for later use
+        if (cached_server_hello) free(cached_server_hello);
         cached_server_hello = malloc(sh_len);
         memcpy(cached_server_hello, buf, sh_len);
         cached_server_hello_size = sh_len;
@@ -225,46 +200,57 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         free_tlv(sh);
         
         global_hs_state = IN_CLIENT_FINISHED;
-        
         return sh_len;
-}    
-//CLIENT SENDING CLIENT FINISHED
-else if (global_type == CLIENT && global_hs_state == IN_CLIENT_FINISHED && server_hello_received) {
-    fprintf(stderr, "CLIENT_FINISHED\n");
-    
-    // Calculate transcript
-    uint8_t transcript_digest[MAC_SIZE];
-    calculate_transcript(transcript_digest);
-    
-    // Create FINISHED message
-    tlv* finished = create_tlv(FINISHED);
-    tlv* transcript = create_tlv(TRANSCRIPT);
-    add_val(transcript, transcript_digest, MAC_SIZE);
-    add_tlv(finished, transcript);
-    
-    // Serialize the FINISHED message
-    uint16_t len = serialize_tlv(buf, finished);
-    
-    // Clean up
-    free_tlv(finished);
-    
-    global_hs_state = IN_SERVER_FINISHED;
-    
-    return len;
-}
+    }    
+    // CLIENT SENDING FINISHED
+    else if (global_type == CLIENT && global_hs_state == IN_CLIENT_FINISHED && server_hello_received) {
+        fprintf(stderr, "CLIENT_FINISHED\n");
+        
+        // Calculate transcript digest
+        uint8_t transcript_digest[MAC_SIZE];
+        calculate_transcript(transcript_digest);
+
+        // Build the FINISHED message with the transcript
+        tlv* transcript = create_tlv(TRANSCRIPT);
+        add_val(transcript, transcript_digest, MAC_SIZE);
+        
+        tlv* finished = create_tlv(FINISHED);
+        add_tlv(finished, transcript);
+        
+        // Serialize the finished message
+        uint16_t len = serialize_tlv(buf, finished);
+        
+        // Debug print to see what we're sending
+        fprintf(stderr, "Serialized FINISHED message (%u bytes):\n", len);
+        print_tlv_bytes(buf, len);
+        
+        // Cache the finished message
+        if (cached_client_finished) free(cached_client_finished);
+        cached_client_finished = malloc(len);
+        memcpy(cached_client_finished, buf, len);
+        cached_client_finished_size = len;
+        
+        // Clean up
+        free_tlv(finished);
+        
+        fprintf(stderr, "CLIENT_FINISHED done\n");
+        global_hs_state = IN_SERVER_FINISHED;
+        return len;
+    }
+
     // SERVER PROCESSING CLIENT FINISHED
     else if (global_type == SERVER && global_hs_state == IN_CLIENT_FINISHED) {
-        //add logic here
+        return 0;
     }
     
     // CLIENT PROCESSING SERVER FINISHED
     else if (global_type == CLIENT && global_hs_state == IN_SERVER_FINISHED) {
-       return;
+        return 0;
     }
     
     // DATA EXCHANGE AFTER HANDSHAKE COMPLETED
     else if (handshake_complete) {
-        //add logic here
+        return 0;
     }
     
     // Default case: pass through to transport layer
@@ -272,63 +258,21 @@ else if (global_type == CLIENT && global_hs_state == IN_CLIENT_FINISHED && serve
 }
 
 void output_sec(uint8_t* buf, size_t length) {    
-
-    switch (global_type)
-    {
-        case CLIENT:
-            if (!server_hello_received && global_hs_state == IN_SERVER_HELLO)
-            {
-                process_server_hello(buf, length);
-                return;
-            }
-            break;
-        case SERVER:
-            if (!client_hello_received)
-            {
-                process_client_hello(buf, length);
-                return;
-            }
-            break;
-        default:
-            break;
+    // SERVER PROCESSING CLIENT HELLO
+    if (global_type == SERVER && !client_hello_received) {
+        process_client_hello(buf, length);
+        return;
     }
-
-
+    
+    // CLIENT PROCESSING SERVER HELLO
+    if (global_type == CLIENT && !server_hello_received && global_hs_state == IN_SERVER_HELLO) {
+        process_server_hello(buf, length);
+        return;
+    }
 
     // If handshake is complete, encrypt outgoing data
     if (handshake_complete) {
-        // Create DATA TLV
-        tlv* data = create_tlv(DATA);
-        
-        // Add IV
-        tlv* iv_tlv = create_tlv(IV);
-        uint8_t iv[IV_SIZE];
-        generate_nonce(iv, IV_SIZE);  // Generate random IV
-        add_val(iv_tlv, iv, IV_SIZE);
-        add_tlv(data, iv_tlv);
-        
-        // Add ciphertext
-        tlv* ciphertext_tlv = create_tlv(CIPHERTEXT);
-        uint8_t ciphertext[length + 16];  // Add some padding for encryption
-        size_t ciphertext_len = encrypt_data(iv, ciphertext, buf, length);
-        add_val(ciphertext_tlv, ciphertext, ciphertext_len);
-        add_tlv(data, ciphertext_tlv);
-        
-        // Add MAC
-        tlv* mac_tlv = create_tlv(MAC);
-        uint8_t mac_value[MAC_SIZE];
-        hmac(mac_value, ciphertext, ciphertext_len);
-        add_val(mac_tlv, mac_value, MAC_SIZE);
-        add_tlv(data, mac_tlv);
-        
-        // Serialize the DATA message
-        uint8_t* output_buf = malloc(length + 256);  // Generous buffer size
-        uint16_t data_len = serialize_tlv(output_buf, data);
-        free_tlv(data);
-        
-        // Send the encrypted data
-        output_io(output_buf, data_len);
-        free(output_buf);
+       //to-do
         return;
     }
     
@@ -336,65 +280,60 @@ void output_sec(uint8_t* buf, size_t length) {
     output_io(buf, length);
 }
 
-
-//handshake helpers i made :)
-
-void process_client_hello(uint8_t* buf, size_t length)
-{
-    // when we receive ch from client (in server)
-        tlv* ch = deserialize_tlv(buf, length);
-        if (ch == NULL || ch->type != CLIENT_HELLO) {
-            if (ch) free_tlv(ch);
-            fprintf(stderr, "Invalid CLIENT_HELLO message\n");
-            return;
-        }
-
-        //print_tlv_bytes(buf, length);
-
-        // Extract the nonce
-        cached_ch_nonce = get_tlv(ch, NONCE);
-        if (cached_ch_nonce == NULL) {
-            free_tlv(ch);
-            fprintf(stderr, "No nonce found in CLIENT_HELLO\n");
-            return;
-        } else {
-            // Save the client nonce for later verification
-            client_nonce = malloc(cached_ch_nonce->length);
-            memcpy(client_nonce, cached_ch_nonce->val, cached_ch_nonce->length);
-            client_nonce_size = cached_ch_nonce->length;
-        }
-
-        // Extract the public key
-        cached_ch_pk = get_tlv(ch, PUBLIC_KEY);
-        if (cached_ch_pk == NULL) {
-            free_tlv(ch);
-            fprintf(stderr, "No public key found in CLIENT_HELLO\n");
-            return;
-        } else {
-            load_peer_public_key(cached_ch_pk->val, cached_ch_pk->length);
-            fprintf(stderr, "Loaded client public key\n");
-        }
-
-        // Cache the client hello
-        cached_ch = ch;
-        cached_client_hello = malloc(length);
-        cached_client_hello_size = length;
-        memcpy(cached_client_hello, buf, length);
-
-        free_tlv(ch);
-
-        
-        // We've processed client hello, now let input_sec know it should generate server hello
-        global_hs_state = IN_SERVER_HELLO;
-        client_hello_received = true;
-        
+void process_client_hello(uint8_t* buf, size_t length) {
+    // When we receive client hello from client (in server)
+    tlv* ch = deserialize_tlv(buf, length);
+    if (ch == NULL || ch->type != CLIENT_HELLO) {
+        if (ch) free_tlv(ch);
+        fprintf(stderr, "Invalid CLIENT_HELLO message\n");
         return;
+    }
+
+    // Extract the nonce
+    tlv* nonce_tlv = get_tlv(ch, NONCE);
+    if (nonce_tlv == NULL) {
+        free_tlv(ch);
+        fprintf(stderr, "No nonce found in CLIENT_HELLO\n");
+        return;
+    } else {
+        // Save the client nonce for later verification
+        if (client_nonce) free(client_nonce);
+        client_nonce = malloc(nonce_tlv->length);
+        memcpy(client_nonce, nonce_tlv->val, nonce_tlv->length);
+        client_nonce_size = nonce_tlv->length;
+    }
+
+    // Extract the public key
+    tlv* pk_tlv = get_tlv(ch, PUBLIC_KEY);
+    if (pk_tlv == NULL) {
+        free_tlv(ch);
+        fprintf(stderr, "No public key found in CLIENT_HELLO\n");
+        return;
+    } else {
+        load_peer_public_key(pk_tlv->val, pk_tlv->length);
+        fprintf(stderr, "Loaded client public key\n");
+    }
+
+    // Cache the client hello - make sure to create an exact copy
+    if (cached_client_hello != NULL) {
+        free(cached_client_hello);
+    }
+    cached_client_hello = malloc(length);
+    cached_client_hello_size = length;
+    memcpy(cached_client_hello, buf, length);
+    
+    // Debug output
+    fprintf(stderr, "Server received and cached Client Hello (%zu bytes):\n", cached_client_hello_size);
+    print_tlv_bytes(cached_client_hello, cached_client_hello_size);
+
+    // Clean up
+    free_tlv(ch);
+    
+    // We've processed client hello, now let input_sec know it should generate server hello
+    global_hs_state = IN_SERVER_HELLO;
+    client_hello_received = true;
 }
 
-
-
-
-// The issue might be in how we're caching the server hello and what data we're using
 void process_server_hello(uint8_t* buf, size_t length) {   
     fprintf(stderr, "Processing server hello\n");
 
@@ -407,9 +346,17 @@ void process_server_hello(uint8_t* buf, size_t length) {
 
     fprintf(stderr, "Server hello received\n");
 
+    // CRITICAL: Cache the server hello - IMPORTANT: store the exact bytes received
+    if (cached_server_hello != NULL) {
+        free(cached_server_hello);
+    }
     cached_server_hello = malloc(length);
     memcpy(cached_server_hello, buf, length);
     cached_server_hello_size = length;
+    
+    // Debug output
+    fprintf(stderr, "Client cached Server Hello (%zu bytes):\n", cached_server_hello_size);
+    print_tlv_bytes(cached_server_hello, cached_server_hello_size);
 
     // Extract certificate from the server hello
     tlv* cert_tlv = get_tlv(sh, CERTIFICATE);
@@ -468,7 +415,7 @@ void process_server_hello(uint8_t* buf, size_t length) {
     }
 
     // 1. Verify certificate was signed by certificate authority
-    uint8_t dns_and_pk[dns_tlv->length + server_pk_tlv->length + 16]; // +16 for TLV overhead
+    uint8_t* dns_and_pk = malloc(dns_tlv->length + 16 + server_pk_tlv->length + 16); // +16 for TLV overhead
     uint8_t* ptr = dns_and_pk;
     
     // Serialize DNS name TLV
@@ -484,8 +431,20 @@ void process_server_hello(uint8_t* buf, size_t length) {
     uint16_t pk_len = serialize_tlv(ptr, pk_tlv_copy);
     free_tlv(pk_tlv_copy);
     
+    // Debug output for verification data
+    fprintf(stderr, "Verifying certificate signature over DNS and public key (%u bytes):\n", dns_len + pk_len);
+    print_tlv_bytes(dns_and_pk, dns_len + pk_len);
+    
+    // Debug output for certificate signature
+    fprintf(stderr, "Certificate signature (%u bytes):\n", cert_sig_tlv->length);
+    print_hex(cert_sig_tlv->val, cert_sig_tlv->length);
+    
     // Verify the certificate with the CA's public key
     int cert_verify = verify(cert_sig_tlv->val, cert_sig_tlv->length, dns_and_pk, dns_len + pk_len, ec_ca_public_key);
+    free(dns_and_pk);
+    
+    fprintf(stderr, "Certificate verification result: %d\n", cert_verify);
+    
     if (cert_verify != 1) {
         free_tlv(sh);
         fprintf(stderr, "Certificate verification failed\n");
@@ -497,20 +456,24 @@ void process_server_hello(uint8_t* buf, size_t length) {
     memcpy(dns_str, dns_tlv->val, dns_tlv->length);
     dns_str[dns_tlv->length] = '\0'; // Null-terminate the string
 
-    if (strstr(dns_str, expected_dns_name) == NULL) {
+    if (expected_dns_name == NULL || strstr(dns_str, expected_dns_name) == NULL) {
         free(dns_str);
         free_tlv(sh);
-        fprintf(stderr, "DNS name mismatch\n");
+        fprintf(stderr, "DNS name mismatch: expected '%s', got '%s'\n", 
+                expected_dns_name ? expected_dns_name : "(null)", dns_str);
         exit(2); // Exit with status 2 if DNS name doesn't match
     }
     free(dns_str);
     
-    // Load server's public key
+    // Load server's public key from the certificate
     load_peer_public_key(server_pk_tlv->val, server_pk_tlv->length);
     
     // 3. Verify Server Hello signature
-    // We need to rebuild the data that was signed, which includes:
-    // Client Hello + Server Nonce + Certificate + Server Public Key
+    // The data that was signed should include:
+    // 1. Client Hello (complete TLV)
+    // 2. Server Nonce (just the TLV)
+    // 3. Certificate (complete TLV)
+    // 4. Server Public Key from Server Hello (complete TLV)
     
     // Get server's public key from the server hello (not certificate)
     tlv* server_pk_hello_tlv = get_tlv(sh, PUBLIC_KEY);
@@ -520,41 +483,77 @@ void process_server_hello(uint8_t* buf, size_t length) {
         return;
     }
     
-    // Calculate total size and allocate buffer for verification data
-    size_t verify_data_size = cached_client_hello_size + 
-                            server_nonce_tlv->length + 16 + // +16 for TLV overhead
-                            cert_tlv->length + 16 +         // +16 for TLV overhead
-                            server_pk_hello_tlv->length + 16; // +16 for TLV overhead
-                            
-    uint8_t* verify_data = malloc(verify_data_size);
-    ptr = verify_data;
+    // Step 1: Gather all the components that need to be signed
     
-    // Add client hello (already in TLV format)
-    memcpy(ptr, cached_client_hello, cached_client_hello_size);
-    ptr += cached_client_hello_size;
+    // Step 1a: Client Hello (already in TLV format)
+    fprintf(stderr, "Signature verification component 1 - Client Hello (%zu bytes)\n", cached_client_hello_size);
+    print_tlv_bytes(cached_client_hello, cached_client_hello_size);
     
-    // Add server nonce TLV
-    tlv* nonce_tlv_copy = create_tlv(NONCE);
-    add_val(nonce_tlv_copy, server_nonce_tlv->val, server_nonce_tlv->length);
-    uint16_t nonce_len = serialize_tlv(ptr, nonce_tlv_copy);
-    ptr += nonce_len;
-    free_tlv(nonce_tlv_copy);
+    // Step 1b: Serialize server nonce
+    uint8_t* nonce_buf = malloc(server_nonce_size + 16); // +16 for TLV overhead
+    tlv* nonce_tlv = create_tlv(NONCE);
+    add_val(nonce_tlv, server_nonce, server_nonce_size);
+    uint16_t nonce_len = serialize_tlv(nonce_buf, nonce_tlv);
+    free_tlv(nonce_tlv);
     
-    // Add certificate TLV
-    uint16_t cert_len = serialize_tlv(ptr, cert_tlv);
-    ptr += cert_len;
+    fprintf(stderr, "Signature verification component 2 - Server Nonce (%u bytes)\n", nonce_len);
+    print_tlv_bytes(nonce_buf, nonce_len);
     
-    // Add server public key TLV
-    tlv* pk_tlv_copy2 = create_tlv(PUBLIC_KEY);
-    add_val(pk_tlv_copy2, server_pk_hello_tlv->val, server_pk_hello_tlv->length);
-    uint16_t pk_len2 = serialize_tlv(ptr, pk_tlv_copy2);
-    free_tlv(pk_tlv_copy2);
+    // Step 1c: Certificate - we need to serialize this from the cert_tlv
+    uint8_t* cert_buf = malloc(1024); // Generous buffer for certificate
+    uint16_t cert_len = serialize_tlv(cert_buf, cert_tlv);
     
-    // Verify the signature with the server's public key
-    int sig_verify = verify(hs_sig_tlv->val, hs_sig_tlv->length, verify_data, 
-                           ptr - verify_data + pk_len2, ec_peer_public_key);
+    fprintf(stderr, "Signature verification component 3 - Certificate (%u bytes)\n", cert_len);
+    print_tlv_bytes(cert_buf, MIN(cert_len, 64));
     
-    free(verify_data);
+    // Step 1d: Server Public Key - Fix: Renamed pk_len to pk_hello_len to avoid redefinition
+    uint8_t* pk_buf = malloc(server_pk_hello_tlv->length + 16); // +16 for TLV overhead
+    tlv* pk_tlv = create_tlv(PUBLIC_KEY);
+    add_val(pk_tlv, server_pk_hello_tlv->val, server_pk_hello_tlv->length);
+    uint16_t pk_hello_len = serialize_tlv(pk_buf, pk_tlv);
+    free_tlv(pk_tlv);
+    
+    fprintf(stderr, "Signature verification component 4 - Server Public Key (%u bytes)\n", pk_hello_len);
+    print_tlv_bytes(pk_buf, pk_hello_len);
+    
+    // Step 2: Concatenate all components for signature verification
+    size_t sig_data_size = cached_client_hello_size + nonce_len + cert_len + pk_hello_len;
+    uint8_t* sig_data = malloc(sig_data_size);
+    uint8_t* sig_ptr = sig_data;
+    
+    // Add client hello
+    memcpy(sig_ptr, cached_client_hello, cached_client_hello_size);
+    sig_ptr += cached_client_hello_size;
+    
+    // Add server nonce
+    memcpy(sig_ptr, nonce_buf, nonce_len);
+    sig_ptr += nonce_len;
+    free(nonce_buf);
+    
+    // Add certificate
+    memcpy(sig_ptr, cert_buf, cert_len);
+    sig_ptr += cert_len;
+    free(cert_buf);
+    
+    // Add server public key
+    memcpy(sig_ptr, pk_buf, pk_hello_len);
+    free(pk_buf);
+    
+    // Debug the signature
+    fprintf(stderr, "Handshake signature to verify (%u bytes):\n", hs_sig_tlv->length);
+    print_hex(hs_sig_tlv->val, hs_sig_tlv->length);
+    
+    // Debug the data being verified
+    fprintf(stderr, "Data being verified for handshake signature (%zu bytes):\n", sig_data_size);
+    print_hex(sig_data, MIN(sig_data_size, 64));
+    if (sig_data_size > 64) fprintf(stderr, "... (truncated)\n");
+    
+    // Step 3: Verify the signature
+    int sig_verify = verify(hs_sig_tlv->val, hs_sig_tlv->length, sig_data, sig_data_size, ec_peer_public_key);
+    
+    free(sig_data);
+    
+    fprintf(stderr, "Server Hello signature verification result: %d\n", sig_verify);
     
     if (sig_verify != 1) {
         free_tlv(sh);
@@ -565,20 +564,30 @@ void process_server_hello(uint8_t* buf, size_t length) {
     // Derive the shared Diffie-Hellman secret
     derive_secret();
     fprintf(stderr, "Shared secret derived\n");
+
     
-    // IMPORTANT: Use the correct salt for key derivation
-    // The salt should be Client Hello + Server Hello (NOT just the nonces)
+    // i read the spec.... the salt should be Client Hello + Server Hello (NOT just the nonces)
     fprintf(stderr, "Creating salt from Client Hello (%zu bytes) + Server Hello (%zu bytes)\n", 
             cached_client_hello_size, cached_server_hello_size);
+
+    //NOW this is where we get the EC + MAC keys
     
-    uint8_t* salt = malloc(cached_client_hello_size + cached_server_hello_size);
+    // Create the salt as Client Hello + Server Hello
+    size_t salt_size = cached_client_hello_size + cached_server_hello_size;
+    uint8_t* salt = malloc(salt_size);
+    
+    // First copy the Client Hello
     memcpy(salt, cached_client_hello, cached_client_hello_size);
+    
+    // Then append the Server Hello
     memcpy(salt + cached_client_hello_size, cached_server_hello, cached_server_hello_size);
     
     // Derive encryption and MAC keys using the correct salt
-    fprintf(stderr, "Deriving keys with salt length: %zu\n", 
-            cached_client_hello_size + cached_server_hello_size);
-    derive_keys(salt, cached_client_hello_size + cached_server_hello_size);
+    fprintf(stderr, "Deriving keys with salt length: %zu\n", salt_size);
+    
+    // This sets up the global MAC key that will be used by hmac()
+    derive_keys(salt, salt_size);
+    
     fprintf(stderr, "Keys derived successfully\n");
     free(salt);
     
@@ -589,7 +598,7 @@ void process_server_hello(uint8_t* buf, size_t length) {
     free_tlv(sh);
 }
 
-
+// Helper function to print buffers in hex
 void print_buffer_hex(const char* label, const uint8_t* buffer, size_t length) {
     fprintf(stderr, "%s (%zu bytes): ", label, length);
     for (size_t i = 0; i < MIN(32, length); i++) {
@@ -599,40 +608,32 @@ void print_buffer_hex(const char* label, const uint8_t* buffer, size_t length) {
     fprintf(stderr, "\n");
 }
 
+// Let's try a simpler client finished message calculation
 void calculate_transcript(uint8_t* transcript_digest) {
-    // Verify we have both cached messages
     if (cached_client_hello == NULL || cached_server_hello == NULL) {
         fprintf(stderr, "CRITICAL ERROR: Cached messages are missing for transcript\n");
         memset(transcript_digest, 0, MAC_SIZE);
         return;
     }
     
-    // EXACT specification: Client-Hello THEN Server-Hello
-    size_t transcript_data_length = cached_client_hello_size + cached_server_hello_size;
-    
-    // Allocate buffer for concatenated messages
+    // Try SERVER_HELLO + CLIENT_HELLO (reverse of your original implementation)
+    size_t transcript_data_length = cached_server_hello_size + cached_client_hello_size;
     uint8_t* transcript_data = malloc(transcript_data_length);
     
-    // CRITICAL: Append Server-Hello EXACTLY after Client-Hello
+    if (!transcript_data) {
+        fprintf(stderr, "Memory allocation failed\n");
+        memset(transcript_digest, 0, MAC_SIZE);
+        return;
+    }
+    
+    //Client-hello with server-hello appended after
     memcpy(transcript_data, cached_client_hello, cached_client_hello_size);
     memcpy(transcript_data + cached_client_hello_size, cached_server_hello, cached_server_hello_size);
     
-    // Debug output
-    fprintf(stderr, "Transcript Calculation Details:\n");
-    fprintf(stderr, "Client Hello Size: %zu\n", cached_client_hello_size);
-    fprintf(stderr, "Server Hello Size: %zu\n", cached_server_hello_size);
-    fprintf(stderr, "Total Transcript Size: %zu\n", transcript_data_length);
+    fprintf(stderr, "Transcript data (%zu bytes):\n", transcript_data_length);
     
-    // Calculate HMAC digest
+    // Calculate HMAC
     hmac(transcript_digest, transcript_data, transcript_data_length);
     
-    // Print digest for verification
-    fprintf(stderr, "Transcript Digest: ");
-    for (int i = 0; i < MAC_SIZE; i++) {
-        fprintf(stderr, "%02x ", transcript_digest[i]);
-    }
-    fprintf(stderr, "\n");
-    
-    // Free temporary buffer
     free(transcript_data);
 }
