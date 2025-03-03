@@ -636,5 +636,4 @@ void calculate_transcript(uint8_t* transcript_digest) {
     hmac(transcript_digest, transcript_data, transcript_data_length);
     
     free(transcript_data);
->>>>>>> 31707102cc30037f1adc29f0093923a1e84e3239
 }
