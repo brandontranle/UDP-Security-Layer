@@ -20,6 +20,8 @@ static uint8_t *cached_client_hello = NULL;
 static size_t cached_client_hello_size = 0;
 static uint8_t *cached_server_hello = NULL;
 static size_t cached_server_hello_size = 0;
+
+
 static uint8_t *cached_client_finished = NULL;
 static size_t cached_client_finished_size = 0;
 static char *expected_dns_name = NULL;
@@ -215,12 +217,6 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         fprintf(stderr, "Serialized FINISHED message (%u bytes):\n", len);
         print_tlv_bytes(buf, len);
         
-        // caching it
-        if (cached_client_finished) free(cached_client_finished);
-        cached_client_finished = malloc(len);
-        memcpy(cached_client_finished, buf, len);
-        cached_client_finished_size = len;
-        
         free_tlv(finished);
         
         fprintf(stderr, "CLIENT_FINISHED done\n");
@@ -230,24 +226,14 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
     }
     // data exchange phase
     else if (handshake_complete) {
-
         // Read plaintext from input (max 943 bytes as per calculation)
+
         uint8_t plaintext[943]; 
         ssize_t plaintext_len = input_io(plaintext, 943);
         
-        //upon finishing processing the client finished, what do we do?
-        if (plaintext_len <= 0) {
-            return 0; // No data to send
-        }
-
+        if (plaintext_len > 0) {
         fprintf(stderr, "Read plaintext (%zd bytes)\n", plaintext_len);
 
-
-
-        
-
-
-        
         // Create DATA TLV
         tlv* data_tlv = create_tlv(DATA);
         
@@ -304,14 +290,14 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         free_tlv(data_tlv);
         
         return len;
+        }
+        return 0;
     }
-    
-    
-    // default: pass through to transport layer
-    return input_io(buf, max_length);
+    return 0;
 }
 
 void output_sec(uint8_t* buf, size_t length) {    
+
     // SERVER PROCESSING CLIENT HELLO
     if (global_type == SERVER && !client_hello_received) {
         process_client_hello(buf, length);
@@ -331,7 +317,6 @@ void output_sec(uint8_t* buf, size_t length) {
 
     // handle receiving data ~ decryption
     if (handshake_complete) {
-        fprintf(stderr, "Received data (%zu bytes):\n", length);
         process_msg(buf, length);
         return;
     }
@@ -455,9 +440,6 @@ void process_server_hello(uint8_t* buf, size_t length) {
         return;
     }
     
-    if (server_nonce) {
-        free(server_nonce);
-    }
     server_nonce = malloc(server_nonce_tlv->length);
     memcpy(server_nonce, server_nonce_tlv->val, server_nonce_tlv->length);
     server_nonce_size = server_nonce_tlv->length;
@@ -474,25 +456,19 @@ void process_server_hello(uint8_t* buf, size_t length) {
     uint8_t* dns_and_pk = malloc(dns_tlv->length + server_pk_tlv->length);
     uint8_t* ptr = dns_and_pk;
     
-    // Serialize DNS name TLV
+    // serialize DNS name TLV
     tlv* dns_tlv_copy = create_tlv(DNS_NAME);
     add_val(dns_tlv_copy, dns_tlv->val, dns_tlv->length);
     uint16_t dns_len = serialize_tlv(ptr, dns_tlv_copy);
     ptr += dns_len;
     free_tlv(dns_tlv_copy);
     
-    // Serialize public key TLV
+    // serialize pub key TLV
     tlv* pk_tlv_copy = create_tlv(PUBLIC_KEY);
     add_val(pk_tlv_copy, server_pk_tlv->val, server_pk_tlv->length);
     uint16_t pk_len = serialize_tlv(ptr, pk_tlv_copy);
     free_tlv(pk_tlv_copy);
     
-    /*
-    fprintf(stderr, "Verifying certificate signature over DNS and public key (%u bytes):\n", dns_len + pk_len);
-    print_tlv_bytes(dns_and_pk, dns_len + pk_len);
-    
-    fprintf(stderr, "Certificate signature (%u bytes):\n", cert_sig_tlv->length);
-    */
 
     // spec says to verify the cert with the CA's public key
     int cert_verify = verify(cert_sig_tlv->val, cert_sig_tlv->length, dns_and_pk, dns_len + pk_len, ec_ca_public_key);
@@ -509,14 +485,12 @@ void process_server_hello(uint8_t* buf, size_t length) {
     // check for dns mismatch
     char* dns_str = malloc(dns_tlv->length + 1);
     memcpy(dns_str, dns_tlv->val, dns_tlv->length);
-    dns_str[dns_tlv->length] = '\0'; // Null-terminate the string
+    dns_str[dns_tlv->length] = '\0'; // null terminate
 
     if (expected_dns_name == NULL || strstr(dns_str, expected_dns_name) == NULL) {
         free(dns_str);
         free_tlv(sh);
-        fprintf(stderr, "DNS name mismatch: expected '%s', got '%s'\n", 
-                expected_dns_name ? expected_dns_name : "(null)", dns_str);
-        exit(2); // Exit with status 2 if DNS name doesn't match
+        exit(2); // exit with status 2 if DNS name doesn't match
     }
     free(dns_str);
         
@@ -533,11 +507,8 @@ void process_server_hello(uint8_t* buf, size_t length) {
     tlv* server_pk_hello_tlv = get_tlv(sh, PUBLIC_KEY);
     if (server_pk_hello_tlv == NULL) {
         free_tlv(sh);
-        fprintf(stderr, "No server public key found in SERVER_HELLO\n");
         return;
     }
-
-    fprintf(stderr, "Server public key found in Server Hello\n");
 
     // step 1: gather all the components that need to be signed
 
@@ -596,12 +567,9 @@ void process_server_hello(uint8_t* buf, size_t length) {
     int sig_verify = verify(hs_sig_tlv->val, hs_sig_tlv->length, sig_data, sig_data_size, ec_peer_public_key);
 
     free(sig_data);
-    
-    fprintf(stderr, "Server Hello signature verification result: %d\n", sig_verify);
-    
+        
     if (sig_verify != 1) {  // Check for != 1 instead of !sig_verify
         free_tlv(sh);
-        fprintf(stderr, "Server Hello signature verification failed\n");
         exit(3); // exit with status 3 if server hello signature verification fails per the spec
     }
     
@@ -611,12 +579,8 @@ void process_server_hello(uint8_t* buf, size_t length) {
 
     // use Diffie-Hellman to derive secret
     derive_secret();
-    fprintf(stderr, "Shared secret derived\n");
 
-    
     // i read the spec.... the salt should be Client Hello + Server Hello (NOT just the nonces)
-    fprintf(stderr, "Creating salt from Client Hello (%zu bytes) + Server Hello (%zu bytes)\n", 
-            cached_client_hello_size, cached_server_hello_size);
 
     //NOW this is where we get the EC + MAC keys
     
@@ -629,14 +593,10 @@ void process_server_hello(uint8_t* buf, size_t length) {
     
     // then append the Server Hello
     memcpy(salt + cached_client_hello_size, cached_server_hello, cached_server_hello_size);
-    
-    // derive encryption and MAC keys using this salt
-    fprintf(stderr, "Deriving keys with salt length: %zu\n", salt_size);
-    
+        
     // this sets up the global MAC key that will be used by hmac()
     derive_keys(salt, salt_size);
     
-    fprintf(stderr, "Keys derived successfully\n");
     free(salt);
     
     // move to next state - generate client finished message in init_sec
@@ -646,13 +606,11 @@ void process_server_hello(uint8_t* buf, size_t length) {
     free_tlv(sh);
 }
 void process_client_finished(uint8_t* buf, size_t length) {
-    fprintf(stderr, "Processing client finished\n");
     
     // find fininshed message
     tlv* finished = deserialize_tlv(buf, length);
     if (finished == NULL || finished->type != FINISHED) {
         if (finished) free_tlv(finished);
-        fprintf(stderr, "Invalid FINISHED message\n");
         return;
     }
     
@@ -660,7 +618,6 @@ void process_client_finished(uint8_t* buf, size_t length) {
     tlv* transcript_tlv = get_tlv(finished, TRANSCRIPT);
     if (transcript_tlv == NULL || transcript_tlv->length != MAC_SIZE) {
         free_tlv(finished);
-        fprintf(stderr, "Invalid or missing transcript in FINISHED message\n");
         return;
     }
     
@@ -672,7 +629,6 @@ void process_client_finished(uint8_t* buf, size_t length) {
     uint8_t* salt = malloc(salt_size);
     if (!salt) {
         free_tlv(finished);
-        fprintf(stderr, "Memory allocation failed for salt\n");
         return;
     }
     
@@ -689,7 +645,6 @@ void process_client_finished(uint8_t* buf, size_t length) {
     uint8_t* transcript_data = malloc(transcript_data_length);
     if (!transcript_data) {
         free_tlv(finished);
-        fprintf(stderr, "Memory allocation failed for transcript data\n");
         return;
     }
     
@@ -703,30 +658,18 @@ void process_client_finished(uint8_t* buf, size_t length) {
     // calculate hmac
     hmac(server_transcript, transcript_data, transcript_data_length);
     free(transcript_data);
-    
-    /*
-    fprintf(stderr, "Client transcript digest (%zu bytes):\n", transcript_tlv->length);
-    print_hex(transcript_tlv->val, transcript_tlv->length);
-    
-    fprintf(stderr, "Server calculated transcript digest (%d bytes):\n", MAC_SIZE);
-    print_hex(server_transcript, MAC_SIZE);
-    */
 
     // compare client vs server digest
     if (memcmp(transcript_tlv->val, server_transcript, MAC_SIZE) != 0) {
         free_tlv(finished);
-        fprintf(stderr, "Transcript verification failed\n");
         exit(4); // exit with status 4 if transcript verification fails (stated in spec)
     }
     
-    //fprintf(stderr, "Transcript verification successful\n");
     free_tlv(finished);
     
     // next state
     global_hs_state = HANDSHAKE_DONE;
     handshake_complete = 1;
-    fprintf(stderr, "Handshake complete\n");
-
     return;
 }
 
@@ -737,16 +680,11 @@ void calculate_transcript(uint8_t* transcript_digest) {
         memset(transcript_digest, 0, MAC_SIZE);
         return;
     }
-    
-    fprintf(stderr, "Calculating transcript from Client Hello (%zu bytes) + Server Hello (%zu bytes)\n", 
-            cached_client_hello_size, cached_server_hello_size);
-    
    
     size_t transcript_data_length = cached_client_hello_size + cached_server_hello_size;
     uint8_t* transcript_data = malloc(transcript_data_length);
     
     if (!transcript_data) {
-        fprintf(stderr, "ERROR: Memory allocation failed for transcript\n");
         memset(transcript_digest, 0, MAC_SIZE);
         return;
     }
@@ -758,15 +696,15 @@ void calculate_transcript(uint8_t* transcript_digest) {
     // calculate HMAC using the established key
     hmac(transcript_digest, transcript_data, transcript_data_length);
 
-    
     free(transcript_data);
 }
 
 void process_msg(uint8_t* buf, size_t length) {
-    tlv* data_tlv = deserialize_tlv(buf, length);
+
+        tlv* data_tlv = deserialize_tlv(buf, length);
         if (data_tlv == NULL || data_tlv->type != DATA) {
             if (data_tlv) free_tlv(data_tlv);
-            fprintf(stderr, "Invalid DATA message\n");
+            fprintf(stderr, "Invalid DATA message\n" );
             return;
         }
         
@@ -822,8 +760,7 @@ void process_msg(uint8_t* buf, size_t length) {
         // Compare the MACs (exact memory comparison as specified)
         if (memcmp(mac_tlv->val, calculated_mac, MAC_SIZE) != 0) {
             free_tlv(data_tlv);
-            fprintf(stderr, "MAC verification failed\n");
-            exit(5); // Exit with status 5 as specified
+            exit(5); // exit with status 5 as specified
         }
         
         // Decrypt the ciphertext
@@ -832,8 +769,6 @@ void process_msg(uint8_t* buf, size_t length) {
         
         // Output the decrypted data
         output_io(plaintext, plaintext_len);
-
-        fprintf(stderr, "Decrypted data (%zu bytes):\n", plaintext_len);
         
         free_tlv(data_tlv);
         return;
