@@ -199,7 +199,6 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         fprintf(stderr, "CLIENT_FINISHED\n");
         //print_tlv_bytes(cached_client_hello, cached_client_hello_size);
 
-        
         // hmac calculation
         uint8_t transcript_digest[MAC_SIZE];
         calculate_transcript(transcript_digest);
@@ -225,13 +224,88 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         free_tlv(finished);
         
         fprintf(stderr, "CLIENT_FINISHED done\n");
-        global_hs_state = IN_SERVER_FINISHED;
+        global_hs_state = HANDSHAKE_DONE;
+        handshake_complete = 1;
         return len;
     }
     // data exchange phase
     else if (handshake_complete) {
-        return 0;
+
+        // Read plaintext from input (max 943 bytes as per calculation)
+        uint8_t plaintext[943]; 
+        ssize_t plaintext_len = input_io(plaintext, 943);
+        
+        //upon finishing processing the client finished, what do we do?
+        if (plaintext_len <= 0) {
+            return 0; // No data to send
+        }
+
+        fprintf(stderr, "Read plaintext (%zd bytes)\n", plaintext_len);
+
+
+
+        
+
+
+        
+        // Create DATA TLV
+        tlv* data_tlv = create_tlv(DATA);
+        
+        // Create IV TLV - but don't generate the IV yet
+        tlv* iv_tlv = create_tlv(IV);
+        uint8_t iv[IV_SIZE]; // IV will be filled by encrypt_data
+        add_val(iv_tlv, iv, IV_SIZE); // Add placeholder value, will be updated
+        add_tlv(data_tlv, iv_tlv);
+        
+        // Create CIPHERTEXT TLV
+        tlv* cipher_tlv = create_tlv(CIPHERTEXT);
+        uint8_t ciphertext[1024]; // Buffer for ciphertext
+        
+        // encrypt_data will fill the IV and return the ciphertext length
+        // The IV is passed as both input and output parameter
+        size_t cipher_len = encrypt_data(iv, ciphertext, plaintext, plaintext_len);
+        add_val(cipher_tlv, ciphertext, cipher_len);
+        add_tlv(data_tlv, cipher_tlv);
+        
+        // Since IV has been updated by encrypt_data, update the value in the TLV
+        // (If our add_val makes a copy, we need to update it)
+        memcpy(iv_tlv->val, iv, IV_SIZE);
+        
+        // Serialize the IV and CIPHERTEXT TLVs for MAC calculation
+        uint8_t iv_tlv_buf[100];
+        uint16_t iv_tlv_len = serialize_tlv(iv_tlv_buf, iv_tlv);
+        
+        uint8_t cipher_tlv_buf[1024];
+        uint16_t cipher_tlv_len = serialize_tlv(cipher_tlv_buf, cipher_tlv);
+        
+        // Allocate buffer for both serialized TLVs
+        uint8_t* mac_data = malloc(iv_tlv_len + cipher_tlv_len);
+        if (!mac_data) {
+            fprintf(stderr, "Memory allocation failed for MAC calculation\n");
+            free_tlv(data_tlv);
+            return 0;
+        }
+        
+        // Combine the serialized TLVs for MAC calculation
+        memcpy(mac_data, iv_tlv_buf, iv_tlv_len);
+        memcpy(mac_data + iv_tlv_len, cipher_tlv_buf, cipher_tlv_len);
+        
+        // Create MAC TLV
+        tlv* mac_tlv = create_tlv(MAC);
+        uint8_t digest[MAC_SIZE];
+        hmac(digest, mac_data, iv_tlv_len + cipher_tlv_len);
+        free(mac_data);
+        
+        add_val(mac_tlv, digest, MAC_SIZE);
+        add_tlv(data_tlv, mac_tlv);
+        
+        // Serialize the DATA message
+        uint16_t len = serialize_tlv(buf, data_tlv);
+        free_tlv(data_tlv);
+        
+        return len;
     }
+    
     
     // default: pass through to transport layer
     return input_io(buf, max_length);
@@ -255,13 +329,19 @@ void output_sec(uint8_t* buf, size_t length) {
         return;
     }
 
-    // encrypt outgoing data
+    // handle receiving data ~ decryption
     if (handshake_complete) {
+        fprintf(stderr, "Received data (%zu bytes):\n", length);
+        process_msg(buf, length);
         return;
     }
 
     output_io(buf, length);
 }
+
+
+
+// helpers i made
 
 void process_client_hello(uint8_t* buf, size_t length) {
 
@@ -507,8 +587,10 @@ void process_server_hello(uint8_t* buf, size_t length) {
     memcpy(sig_ptr, pk_buf, pk_hello_len);
     free(pk_buf);
 
+    /*
     fprintf(stderr, "Server Hello signature (%zu bytes):\n", hs_sig_tlv->length);
     fprintf(stderr, "EC PEER PUBLIC KEY: %p\n", ec_peer_public_key);    
+    */
 
     // step 3: verify the signature
     int sig_verify = verify(hs_sig_tlv->val, hs_sig_tlv->length, sig_data, sig_data_size, ec_peer_public_key);
@@ -517,7 +599,7 @@ void process_server_hello(uint8_t* buf, size_t length) {
     
     fprintf(stderr, "Server Hello signature verification result: %d\n", sig_verify);
     
-if (sig_verify != 1) {  // Check for != 1 instead of !sig_verify
+    if (sig_verify != 1) {  // Check for != 1 instead of !sig_verify
         free_tlv(sh);
         fprintf(stderr, "Server Hello signature verification failed\n");
         exit(3); // exit with status 3 if server hello signature verification fails per the spec
@@ -599,7 +681,7 @@ void process_client_finished(uint8_t* buf, size_t length) {
     memcpy(salt + cached_client_hello_size, cached_server_hello, cached_server_hello_size);
     
     // rederive keys with this salt to match client
-    fprintf(stderr, "Server rederiving keys with salt length: %zu\n", salt_size);
+    //fprintf(stderr, "Server rederiving keys with salt length: %zu\n", salt_size);
     derive_keys(salt, salt_size);
     free(salt);
     
@@ -637,13 +719,15 @@ void process_client_finished(uint8_t* buf, size_t length) {
         exit(4); // exit with status 4 if transcript verification fails (stated in spec)
     }
     
-    fprintf(stderr, "Transcript verification successful\n");
+    //fprintf(stderr, "Transcript verification successful\n");
     free_tlv(finished);
     
     // next state
     global_hs_state = HANDSHAKE_DONE;
     handshake_complete = 1;
     fprintf(stderr, "Handshake complete\n");
+
+    return;
 }
 
 
@@ -671,19 +755,86 @@ void calculate_transcript(uint8_t* transcript_digest) {
     memcpy(transcript_data, cached_client_hello, cached_client_hello_size);
     memcpy(transcript_data + cached_client_hello_size, cached_server_hello, cached_server_hello_size);
     
-    /*
-    fprintf(stderr, "First 32 bytes of transcript data:\n");
-    print_hex(transcript_data, MIN(32, transcript_data_length));
-    fprintf(stderr, "Last 32 bytes of transcript data:\n");
-    print_hex(transcript_data + transcript_data_length - MIN(32, transcript_data_length), 
-              MIN(32, transcript_data_length));
-    */
-
     // calculate HMAC using the established key
     hmac(transcript_digest, transcript_data, transcript_data_length);
-    
-    fprintf(stderr, "Calculated transcript digest:\n");
-    print_hex(transcript_digest, MAC_SIZE);
+
     
     free(transcript_data);
 }
+
+void process_msg(uint8_t* buf, size_t length) {
+    tlv* data_tlv = deserialize_tlv(buf, length);
+        if (data_tlv == NULL || data_tlv->type != DATA) {
+            if (data_tlv) free_tlv(data_tlv);
+            fprintf(stderr, "Invalid DATA message\n");
+            return;
+        }
+        
+        // Extract IV
+        tlv* iv_tlv = get_tlv(data_tlv, IV);
+        if (iv_tlv == NULL || iv_tlv->length != IV_SIZE) {
+            free_tlv(data_tlv);
+            fprintf(stderr, "Invalid or missing IV in DATA message\n");
+            return;
+        }
+        
+        // Extract CIPHERTEXT
+        tlv* cipher_tlv = get_tlv(data_tlv, CIPHERTEXT);
+        if (cipher_tlv == NULL) {
+            free_tlv(data_tlv);
+            fprintf(stderr, "Missing CIPHERTEXT in DATA message\n");
+            return;
+        }
+        
+        // Extract MAC
+        tlv* mac_tlv = get_tlv(data_tlv, MAC);
+        if (mac_tlv == NULL || mac_tlv->length != MAC_SIZE) {
+            free_tlv(data_tlv);
+            fprintf(stderr, "Invalid or missing MAC in DATA message\n");
+            return;
+        }
+        
+        // Verify the MAC using the TLV encoding
+        // First, serialize the IV TLV
+        uint8_t iv_tlv_buf[100]; // Buffer for serialized IV TLV
+        uint16_t iv_tlv_len = serialize_tlv(iv_tlv_buf, iv_tlv);
+        
+        // Then, serialize the CIPHERTEXT TLV
+        uint8_t cipher_tlv_buf[1024]; // Buffer for serialized CIPHERTEXT TLV
+        uint16_t cipher_tlv_len = serialize_tlv(cipher_tlv_buf, cipher_tlv);
+        
+        // Allocate buffer for both serialized TLVs
+        uint8_t* iv_cipher_buf = malloc(iv_tlv_len + cipher_tlv_len);
+        if (!iv_cipher_buf) {
+            fprintf(stderr, "Memory allocation failed for MAC verification\n");
+            free_tlv(data_tlv);
+            return;
+        }
+        
+        // Combine the serialized TLVs
+        memcpy(iv_cipher_buf, iv_tlv_buf, iv_tlv_len);
+        memcpy(iv_cipher_buf + iv_tlv_len, cipher_tlv_buf, cipher_tlv_len);
+        
+        uint8_t calculated_mac[MAC_SIZE];
+        hmac(calculated_mac, iv_cipher_buf, iv_tlv_len + cipher_tlv_len);
+        free(iv_cipher_buf);
+        
+        // Compare the MACs (exact memory comparison as specified)
+        if (memcmp(mac_tlv->val, calculated_mac, MAC_SIZE) != 0) {
+            free_tlv(data_tlv);
+            fprintf(stderr, "MAC verification failed\n");
+            exit(5); // Exit with status 5 as specified
+        }
+        
+        // Decrypt the ciphertext
+        uint8_t plaintext[1024];
+        size_t plaintext_len = decrypt_cipher(plaintext, cipher_tlv->val, cipher_tlv->length, iv_tlv->val);
+        
+        // Output the decrypted data
+        output_io(plaintext, plaintext_len);
+
+        fprintf(stderr, "Decrypted data (%zu bytes):\n", plaintext_len);
+        
+        free_tlv(data_tlv);
+        return;
+    }
