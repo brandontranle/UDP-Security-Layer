@@ -228,18 +228,6 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         global_hs_state = IN_SERVER_FINISHED;
         return len;
     }
-    /*
-    // server processing client FINISHED
-    else if (global_type == SERVER && global_hs_state == IN_CLIENT_FINISHED) {
-        fprintf(stderr, "SERVER_FINISHED\n");
-        return 0;
-    }
-    
-    // client processing server FINISHED
-    else if (global_type == CLIENT && global_hs_state == IN_SERVER_FINISHED) {
-        return 0;
-    }
-    */
     // data exchange phase
     else if (handshake_complete) {
         return 0;
@@ -259,6 +247,11 @@ void output_sec(uint8_t* buf, size_t length) {
     // CLIENT PROCESSING SERVER HELLO (leads to key derivation + FINISHED message)
     if (global_type == CLIENT && !server_hello_received && global_hs_state == IN_SERVER_HELLO) {
         process_server_hello(buf, length);
+        return;
+    }
+
+    if (global_type == SERVER && global_hs_state == IN_CLIENT_FINISHED) {
+        process_client_finished(buf, length);
         return;
     }
 
@@ -446,10 +439,7 @@ void process_server_hello(uint8_t* buf, size_t length) {
         exit(2); // Exit with status 2 if DNS name doesn't match
     }
     free(dns_str);
-    
-   
-    //fprintf(stderr, "DNS name matches\n");
-    
+        
     /*
      3. Verify Server Hello signature
      The data that was signed should include:
@@ -518,7 +508,6 @@ void process_server_hello(uint8_t* buf, size_t length) {
     free(pk_buf);
 
     fprintf(stderr, "Server Hello signature (%zu bytes):\n", hs_sig_tlv->length);
-        
     fprintf(stderr, "EC PEER PUBLIC KEY: %p\n", ec_peer_public_key);    
 
     // step 3: verify the signature
@@ -533,8 +522,6 @@ if (sig_verify != 1) {  // Check for != 1 instead of !sig_verify
         fprintf(stderr, "Server Hello signature verification failed\n");
         exit(3); // exit with status 3 if server hello signature verification fails per the spec
     }
-    
-
     
      // NOW: we can load the server's actual public key for the key derivation (this shits so stupid)
      load_peer_public_key(server_pk_hello_tlv->val, server_pk_hello_tlv->length);
@@ -576,35 +563,127 @@ if (sig_verify != 1) {  // Check for != 1 instead of !sig_verify
     
     free_tlv(sh);
 }
+void process_client_finished(uint8_t* buf, size_t length) {
+    fprintf(stderr, "Processing client finished\n");
+    
+    // find fininshed message
+    tlv* finished = deserialize_tlv(buf, length);
+    if (finished == NULL || finished->type != FINISHED) {
+        if (finished) free_tlv(finished);
+        fprintf(stderr, "Invalid FINISHED message\n");
+        return;
+    }
+    
+    // extract transcript
+    tlv* transcript_tlv = get_tlv(finished, TRANSCRIPT);
+    if (transcript_tlv == NULL || transcript_tlv->length != MAC_SIZE) {
+        free_tlv(finished);
+        fprintf(stderr, "Invalid or missing transcript in FINISHED message\n");
+        return;
+    }
+    
+    //to do this next part, we need to mimic the client. follow the same steps as the client. 
+
+    derive_secret();
+    
+    size_t salt_size = cached_client_hello_size + cached_server_hello_size;
+    uint8_t* salt = malloc(salt_size);
+    if (!salt) {
+        free_tlv(finished);
+        fprintf(stderr, "Memory allocation failed for salt\n");
+        return;
+    }
+    
+    // create salt in same order: ch + sh
+    memcpy(salt, cached_client_hello, cached_client_hello_size);
+    memcpy(salt + cached_client_hello_size, cached_server_hello, cached_server_hello_size);
+    
+    // rederive keys with this salt to match client
+    fprintf(stderr, "Server rederiving keys with salt length: %zu\n", salt_size);
+    derive_keys(salt, salt_size);
+    free(salt);
+    
+    size_t transcript_data_length = cached_client_hello_size + cached_server_hello_size;
+    uint8_t* transcript_data = malloc(transcript_data_length);
+    if (!transcript_data) {
+        free_tlv(finished);
+        fprintf(stderr, "Memory allocation failed for transcript data\n");
+        return;
+    }
+    
+    // ch + sh
+    memcpy(transcript_data, cached_client_hello, cached_client_hello_size);
+    memcpy(transcript_data + cached_client_hello_size, cached_server_hello, cached_server_hello_size);
+    
+    uint8_t server_transcript[MAC_SIZE];
+    memset(server_transcript, 0, MAC_SIZE);
+    
+    // calculate hmac
+    hmac(server_transcript, transcript_data, transcript_data_length);
+    free(transcript_data);
+    
+    /*
+    fprintf(stderr, "Client transcript digest (%zu bytes):\n", transcript_tlv->length);
+    print_hex(transcript_tlv->val, transcript_tlv->length);
+    
+    fprintf(stderr, "Server calculated transcript digest (%d bytes):\n", MAC_SIZE);
+    print_hex(server_transcript, MAC_SIZE);
+    */
+
+    // compare client vs server digest
+    if (memcmp(transcript_tlv->val, server_transcript, MAC_SIZE) != 0) {
+        free_tlv(finished);
+        fprintf(stderr, "Transcript verification failed\n");
+        exit(4); // exit with status 4 if transcript verification fails (stated in spec)
+    }
+    
+    fprintf(stderr, "Transcript verification successful\n");
+    free_tlv(finished);
+    
+    // next state
+    global_hs_state = HANDSHAKE_DONE;
+    handshake_complete = 1;
+    fprintf(stderr, "Handshake complete\n");
+}
 
 
 void calculate_transcript(uint8_t* transcript_digest) {
     if (cached_client_hello == NULL || cached_server_hello == NULL) {
-        fprintf(stderr, "cached messages are missing for transcript\n");
+        fprintf(stderr, "ERROR: Cached messages are missing for transcript\n");
         memset(transcript_digest, 0, MAC_SIZE);
         return;
     }
     
-    // client hello + server hello
+    fprintf(stderr, "Calculating transcript from Client Hello (%zu bytes) + Server Hello (%zu bytes)\n", 
+            cached_client_hello_size, cached_server_hello_size);
+    
+   
     size_t transcript_data_length = cached_client_hello_size + cached_server_hello_size;
     uint8_t* transcript_data = malloc(transcript_data_length);
     
     if (!transcript_data) {
-        fprintf(stderr, "Memory allocation failed\n");
+        fprintf(stderr, "ERROR: Memory allocation failed for transcript\n");
         memset(transcript_digest, 0, MAC_SIZE);
         return;
     }
     
-    // client-hello with server-hello appended after
+    // concatenate cached messages (ch+sh)
     memcpy(transcript_data, cached_client_hello, cached_client_hello_size);
     memcpy(transcript_data + cached_client_hello_size, cached_server_hello, cached_server_hello_size);
     
-    fprintf(stderr, "Transcript data (%zu bytes):\n", transcript_data_length);
-    
-    // calculate HMAC
-    hmac(transcript_digest, transcript_data, transcript_data_length);
+    /*
+    fprintf(stderr, "First 32 bytes of transcript data:\n");
+    print_hex(transcript_data, MIN(32, transcript_data_length));
+    fprintf(stderr, "Last 32 bytes of transcript data:\n");
+    print_hex(transcript_data + transcript_data_length - MIN(32, transcript_data_length), 
+              MIN(32, transcript_data_length));
+    */
 
-    print_tlv_bytes(transcript_data, transcript_data_length); // i stg this is right!
+    // calculate HMAC using the established key
+    hmac(transcript_digest, transcript_data, transcript_data_length);
+    
+    fprintf(stderr, "Calculated transcript digest:\n");
+    print_hex(transcript_digest, MAC_SIZE);
     
     free(transcript_data);
 }
